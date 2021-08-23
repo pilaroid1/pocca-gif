@@ -2,149 +2,151 @@
     POCCA GIF
 """
 import sys
-sys.path.append("../")
+sys.path.append("/media/usb/apps")
 import time
-import configparser
 import os
-import signal
-
 from pocca.display.interface import Interface
+from pocca.display.countdown import Countdown
 from pocca.vision.camera import Camera #Pi Camera Manager
 from pocca.vision.effects import Effects # OpenCV Effects
 from pocca.vision.convert import Convert # FFMPEG Conversion
 from pocca.controls.buttons import Buttons # Joystick / Buttons
+from pocca.utils.app import App # Application Manager (Settings / Secrets / utilities)
 
-# Detect a CTRL-C abord program interrupt, and gracefully exit the application
-def sigint_handler(signal, frame):
-    print(TEXT.DEV_STOP)
-    going = False
-    sys.exit(0)
+app = App()
+app.clear_terminal()
+print(app.TEXT.LOCK_WARNING)
+print(" ~~~~~~ 📷 Pilaroid GIF 📷  ~~~~~~")
+print(" https://github.com/usini/pocca-gif")
 
-# Enable abord program interrupt
-signal.signal(signal.SIGINT, sigint_handler)
+interface = Interface(app.settings, app.system)
+countdown = Countdown(app.settings, app.TEXT)
+effects = Effects(app.settings)
+convert = Convert(app.TEXT)
+buttons = Buttons(app.TEXT)
 
-settings = configparser.ConfigParser()
-settings.read("/media/usb/pocca.ini")
-if settings["APPLICATION"]["lang"]:
-    from pocca.localization.fr import TEXT
-else:
-    from pocca.localization.en import TEXT
-path_images = settings["FOLDERS"]["pictures"]
-path_temp = settings["FOLDERS"]["temp"]
-
-print("\033c", end="") # Clear Terminal
-print(" ~~~~~~ 📷 POCCA GIF 📷 ~~~~~~")
-print(TEXT.LOCK_WARNING)
-
-interface = Interface(settings)
-camera = Camera(settings, TEXT)
-effects = Effects()
-convert = Convert(TEXT)
-buttons = Buttons(TEXT)
-
-interface.start()
-camera.start()
+camera = Camera(app.settings, app.TEXT, app.camera_resolution)
 camera.clear_temp() # Remove Previous Images
 
-going = True
+# If we exit the application, we go here
+def stop(signal, frame):
+    print(app.TEXT.SHUTDOWN_APP)
+    app.running = False
+app.stop_function(stop)
+
+gif_rate = 1 / float(app.settings["APPLICATION"]["gif_rate"])
+gif_fps = app.settings["APPLICATION"]["gif_rate"]
+gif_nb = int(app.settings["APPLICATION"]["gif_images"])
 start_timer = 0
-countdown = 0
-# Enable Screen
-tft_enable = True
+color_id = 0
 
-print (" ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
-gif_rate = 1 / float(settings["CAMERA"]["gif_rate"])
-gif_nb = int(settings["CAMERA"]["gif_images"])
-
-while going:
+def run():
     # Viewfinder (Live preview)
     if interface.state == "viewfinder":
-        try:
-            # Capture frame continously
-            for frame in camera.stream.capture_continuous(camera.rawCapture, format='bgr', use_video_port=True):
-                # Get array of RGB from images
-                frame = frame.array
+        # Capture frame continously
+        for frame in camera.stream.capture_continuous(camera.rawCapture, format='bgr', use_video_port=True):
+            # Get array of RGB from images
+            frame = frame.array
 
-                # Effects
-                if(effects.id == effects.EFFECT_CONTOURS):
-                    # Canny Detection Effects (contours)
-                    frame = effects.canny_edge(frame)
-                    frame = effects.color_change(frame, (0,0,255)) # RED
+            if not app.running:
+                sys.exit(0)
 
-                # Resize image to screen resolution
-                frame_resize = camera.resize(frame, (interface.resolution))
-                # Copy image to screen
-                interface.to_screen(frame_resize)
-                interface.top_left(interface.state)
-                interface.top_right("gif")
+            # Effects
+            if(effects.id == effects.CONTOURS):
+                # Canny Detection Effects (contours)
+                frame = effects.canny_edge(frame)
+                frame = effects.color_change(frame) # RED
 
-                if(countdown > 0):
-                    interface.bottom(str(countdown))
+            # Resize image to screen resolution
+            frame_resize = camera.resize(frame, (interface.resolution))
+            # Copy image to screen
+            interface.to_screen(frame_resize)
+            interface.top_left(interface.state)
+            interface.top_right("gif")
 
-                if interface.state == "countdown" :
-                    if time.time() > (start_timer + 1):
-                        print(TEXT.TIMER + " : " + str(countdown))
-                        if countdown > 0:
-                            countdown = countdown - 1
+            if countdown.running():
+                if countdown.started:
+                    interface.bottom(str(countdown.current()))
+                else:
+                    interface.state = "record"
+
+            interface.update()
+
+            # If we are in record mode
+            if interface.state == "record":
+                    # Take a timelapse
+                    # gif_nb : number of pictures taken
+                    # gif_rate : delay between each picture
+                    if time.time() > (start_timer + gif_rate):
+                        if(camera.count() < gif_nb):
+                            camera.save(frame, app.path["temp"] + "/images/", "gif")
                         else:
-                            interface.state = "record"
-                        start_timer = time.time()
-
-                # If we are in record mode
-                if interface.state == "record":
-                        # Take a timelapse
-                        # gif_nb : number of pictures taken
-                        # gif_rate : delay between each picture
-                        if time.time() > (start_timer + gif_rate):
-                            if(camera.count() < gif_nb):
-                                camera.save(frame, path_temp, "gif")
+                            interface.image("saving" , 0, 0)
+                            interface.update()
+                            error, filename = convert.gif(app.path["temp"] + "/images/", app.path["images"], gif_fps)
+                            if error == 0:
+                                print(app.TEXT.TIMELAPSE_CONVERTED)
+                                camera.save_timestamp(filename)
                             else:
-                                interface.state = "preview"
-                                print(TEXT.TIMELAPSE_END)
-                                camera.rawCapture.truncate(0)
-                                # Truncate camera raw capture (need to avoid crash)
-                                break
+                                print(app.TEXT.TIMELAPSE_CONVERT_FAILED)
+                            interface.state = "preview"
+                            print(app.TEXT.TIMELAPSE_END)
 
-                            # Reset timer (to take another pictures)
-                            start_timer = time.time()
+            camera.refresh()
+            controls()
 
-                # Check if a button is pressed
-                pressed = buttons.check()
+def controls():
+    global color_id
+    # Check if a button is pressed
+    pressed = buttons.check()
 
+    if interface.state == "viewfinder":
+        # If the button is pressed
+        if pressed == buttons.BTN: # or  web_action == 1:
+            if not countdown.running():
+                countdown.start()
+        elif pressed == buttons.BTN2:
+            if color_id < 6:
+                effects.id = effects.CONTOURS
+                color_id += 1
+                if color_id == 1:
+                    effects.color_lines = (0,0,1)
+                    effects.color_background = (0,0,0)
+                elif color_id == 2:
+                    effects.color_lines = (0,1,0)
+                    effects.color_background = (0,0,0)
+                elif color_id == 3:
+                    effects.color_lines = (1,0,0)
+                    effects.color_background = (0,0,0)
+                elif color_id == 4:
+                    effects.color_lines = (1,1,1)
+                    effects.color_background = (0,0,255)
+                elif color_id == 5:
+                    effects.color_lines = (1,1,1)
+                    effects.color_background = (0,255,0)
+                elif color_id == 6:
+                    effects.color_lines = (1,1,1)
+                    effects.color_background = (255,0,0)
+            else:
+                color_id = 0
+                effects.id = effects.NO
+            print(color_id)
+            print(effects.name)
 
-                # If the button is pressed
-                if pressed == buttons.BTN: # or  web_action == 1:
-                    start_timer = time.time()
-                    countdown = 3
-                    interface.state = "countdown"
-                elif pressed == buttons.BTN2:
-                    if(effects.id == effects.EFFECT_NONE):
-                        effects.id = effects.EFFECT_CONTOURS
-                    else:
-                        effects.id = effects.EFFECT_NONE
-                camera.rawCapture.truncate(0)
-
-        # If the video capture failed, crash gracefully
-        except Exception as error:
-            raise # Add this to check error
-            print("❌ ➡️" + str(error))
-            going = False
-
-    # Preview mode (show timelapse/panorama)
+   # Preview mode (show timelapse/panorama)
     if interface.state == "preview":
-        pressed = buttons.check()
-
-        images = os.listdir(path_temp)
+        images = os.listdir(app.path["temp"] + "/images/")
         sorted(images)
         # print(images)
         counter = 0
         preview = True
+        start_timer = 0
         if(len(images) != 0):
             while(preview):
                 pressed = buttons.check()
                 if time.time() > (start_timer + gif_rate):
-                    interface.load(path_temp + "/" + images[counter])
+                    interface.load(app.path["temp"] + "/images/" + images[counter])
                     start_timer = time.time()
 
                     if counter < len(images) - 1:
@@ -153,23 +155,16 @@ while going:
                         counter = 0
                     # If a button is pressed, convert images to gif
                 if pressed != buttons.NOACTION:
-                    interface.image("saving" , 0, 0)
-                    error = convert.gif(path_temp, path_images)
-                    if error == 0:
-                        print(TEXT.TIMELAPSE_CONVERTED)
-                        camera.clear_temp() # Delete old timelapse
-                    else:
-                        print(TEXT.TIMELAPSE_CONVERT_FAILED)
+                    camera.clear_temp() # Delete old timelapse
                     preview = False
                     interface.state = "viewfinder"
-                    break
                 interface.top_left(interface.state)
                 interface.top_right("gif")
+                interface.update()
+                if not app.running:
+                    sys.exit(0)
 
-            camera.rawCapture.truncate(0)
+            camera.refresh()
 
-# If we exit the application, we go here
-print(TEXT.SHUTDOWN_APP)
-camera.stop()
-interface.stop()
-sys.exit(1)
+
+run()
